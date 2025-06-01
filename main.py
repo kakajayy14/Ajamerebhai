@@ -393,75 +393,89 @@ async def handle_terms_response(update: Update, context: ContextTypes.DEFAULT_TY
     username = update.effective_user.username or f"user_{user_id}"
     today = get_indian_time().strftime('%Y-%m-%d')
 
-    # Save user data automatically
-    conn = sqlite3.connect('bot_database.db')
+    # Save user data automatically with proper error handling
+    conn = sqlite3.connect('bot_database.db', timeout=30)
     cursor = conn.cursor()
 
-    cursor.execute(
-        "INSERT INTO users (user_id, name, age, username, registration_date, last_login, terms_accepted) VALUES (?, ?, ?, ?, ?, ?, 1)",
-        (user_id, user_first_name, 18, username, today, today)
-    )
+    try:
+        # Check if user already exists
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        existing_user = cursor.fetchone()
 
-    # Record the first login
-    cursor.execute(
-        "INSERT INTO daily_logins (user_id, login_date) VALUES (?, ?)",
-        (user_id, today)
-    )
+        if not existing_user:
+            # Insert new user
+            cursor.execute(
+                "INSERT INTO users (user_id, name, age, username, registration_date, last_login, terms_accepted) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (user_id, user_first_name, 18, username, today, today)
+            )
 
-    # Log this activity
-    cursor.execute(
-        "INSERT INTO user_activity (user_id, activity_type, details, activity_date) VALUES (?, ?, ?, ?)",
-        (user_id, "REGISTRATION", f"User registered automatically", today)
-    )
+            # Record the first login (use INSERT OR IGNORE to prevent duplicates)
+            cursor.execute(
+                "INSERT OR IGNORE INTO daily_logins (user_id, login_date) VALUES (?, ?)",
+                (user_id, today)
+            )
 
-    # Record the welcome bonus transaction
-    cursor.execute(
-        "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
-        (user_id, 10, "Welcome bonus", today)
-    )
+            # Log this activity
+            cursor.execute(
+                "INSERT INTO user_activity (user_id, activity_type, details, activity_date) VALUES (?, ?, ?, ?)",
+                (user_id, "REGISTRATION", f"User registered automatically", today)
+            )
 
-    # Check if this user was referred by someone
-    if 'referrer_id' in context.user_data:
-        referrer_id = context.user_data['referrer_id']
+            # Record the welcome bonus transaction
+            cursor.execute(
+                "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
+                (user_id, 10, "Welcome bonus", today)
+            )
 
-        # Make sure referrer exists and is not the same as new user
-        if referrer_id != user_id:
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (referrer_id,))
-            referrer = cursor.fetchone()
+            # Check if this user was referred by someone
+            if 'referrer_id' in context.user_data:
+                referrer_id = context.user_data['referrer_id']
 
-            if referrer:
-                # Give the referrer 5 stars
-                cursor.execute("UPDATE users SET stars = stars + 5 WHERE user_id = ?", (referrer_id,))
+                # Make sure referrer exists and is not the same as new user
+                if referrer_id != user_id:
+                    cursor.execute("SELECT * FROM users WHERE user_id = ?", (referrer_id,))
+                    referrer = cursor.fetchone()
 
-                # Give the new user 2 extra stars (on top of welcome bonus)
-                cursor.execute("UPDATE users SET stars = stars + 2 WHERE user_id = ?", (user_id,))
+                    if referrer:
+                        # Give the referrer 5 stars
+                        cursor.execute("UPDATE users SET stars = stars + 5 WHERE user_id = ?", (referrer_id,))
 
-                # Record transactions for both users
-                cursor.execute(
-                    "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
-                    (referrer_id, 5, f"Referral reward for user {user_id}", today)
-                )
+                        # Give the new user 2 extra stars (on top of welcome bonus)
+                        cursor.execute("UPDATE users SET stars = stars + 2 WHERE user_id = ?", (user_id,))
 
-                cursor.execute(
-                    "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
-                    (user_id, 2, "Referred user bonus", today)
-                )
+                        # Record transactions for both users
+                        cursor.execute(
+                            "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
+                            (referrer_id, 5, f"Referral reward for user {user_id}", today)
+                        )
 
-                # Try to notify the referrer
-                try:
-                    await context.bot.send_message(
-                        chat_id=referrer_id,
-                        text=f"🎉 *REFERRAL BONUS* 🎉\n\n"
-                             f"Someone joined using your referral link!\n\n"
-                             f"*Bonus:* +5 ⭐ added to your account\n\n"
-                             f"Keep sharing your link to earn more stars!",
-                        parse_mode='Markdown'
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send referral notification to user {referrer_id}: {e}")
+                        cursor.execute(
+                            "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
+                            (user_id, 2, "Referred user bonus", today)
+                        )
 
-    conn.commit()
-    conn.close()
+                        # Try to notify the referrer
+                        try:
+                            await context.bot.send_message(
+                                chat_id=referrer_id,
+                                text=f"🎉 *REFERRAL BONUS* 🎉\n\n"
+                                     f"Someone joined using your referral link!\n\n"
+                                     f"*Bonus:* +5 ⭐ added to your account\n\n"
+                                     f"Keep sharing your link to earn more stars!",
+                                parse_mode='Markdown'
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to send referral notification to user {referrer_id}: {e}")
+        else:
+            # User already exists, just update terms accepted
+            cursor.execute("UPDATE users SET terms_accepted = 1 WHERE user_id = ?", (user_id,))
+
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Database error in handle_terms_response: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
     # Show welcome message and redirect to home
     await query.message.edit_text(
@@ -721,38 +735,45 @@ async def update_login_and_give_stars(user_id):
     conn = sqlite3.connect('bot_database.db', timeout=30)
     cursor = conn.cursor()
 
-    # Update last login
-    cursor.execute("UPDATE users SET last_login = ? WHERE user_id = ?", (today, user_id))
+    try:
+        # Update last login
+        cursor.execute("UPDATE users SET last_login = ? WHERE user_id = ?", (today, user_id))
 
-    # Check if already logged in today
-    cursor.execute("SELECT * FROM daily_logins WHERE user_id = ? AND login_date = ?", (user_id, today))
-    already_logged = cursor.fetchone()
+        # Check if already logged in today
+        cursor.execute("SELECT * FROM daily_logins WHERE user_id = ? AND login_date = ?", (user_id, today))
+        already_logged = cursor.fetchone()
 
-    if not already_logged:
-        # Give daily stars and record login
-        cursor.execute("UPDATE users SET stars = stars + 5 WHERE user_id = ?", (user_id,))
-        cursor.execute("INSERT OR IGNORE INTO daily_logins (user_id, login_date) VALUES (?, ?)", (user_id, today))
+        if not already_logged:
+            # Give daily stars and record login
+            cursor.execute("UPDATE users SET stars = stars + 5 WHERE user_id = ?", (user_id,))
+            cursor.execute("INSERT OR IGNORE INTO daily_logins (user_id, login_date) VALUES (?, ?)", (user_id, today))
 
-        # Record the transaction
-        cursor.execute(
-            "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
-            (user_id, 5, "Daily login bonus", today)
-        )
+            # Record the transaction
+            cursor.execute(
+                "INSERT INTO transactions (user_id, amount, description, transaction_date) VALUES (?, ?, ?, ?)",
+                (user_id, 5, "Daily login bonus", today)
+            )
 
-        # Log the activity
-        cursor.execute(
-            "INSERT INTO user_activity (user_id, activity_type, details, activity_date) VALUES (?, ?, ?, ?)",
-            (user_id, "LOGIN", "User received daily login bonus", today)
-        )
+            # Log the activity
+            cursor.execute(
+                "INSERT INTO user_activity (user_id, activity_type, details, activity_date) VALUES (?, ?, ?, ?)",
+                (user_id, "LOGIN", "User received daily login bonus", today)
+            )
 
-        conn.commit()
-        logger.info(f"Daily login bonus of 5 stars added to user {user_id}")
+            conn.commit()
+            logger.info(f"Daily login bonus of 5 stars added to user {user_id}")
+            return True  # Return True if bonus was given
+        else:
+            logger.info(f"User {user_id} already received daily login bonus today")
+            conn.commit()
+            return False  # Return False if no bonus given
+
+    except Exception as e:
+        logger.error(f"Database error in update_login_and_give_stars for user {user_id}: {e}")
+        conn.rollback()
+        return False
+    finally:
         conn.close()
-        return True  # Return True if bonus was given
-    else:
-        logger.info(f"User {user_id} already received daily login bonus today")
-        conn.close()
-        return False  # Return False if no bonus given
 
 # Modern Home menu with inline keyboards
 async def show_home_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1462,7 +1483,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     user_id = update.effective_user.id
 
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.error(f"Error answering callback query: {e}")
+        # Continue processing even if answer fails
 
     # Handle channel rejoin check
     if query.data == "check_rejoin":
